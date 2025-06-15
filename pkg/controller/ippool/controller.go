@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/pointer"
 
 	"github.com/harvester/vm-dhcp-controller/pkg/apis/network.harvesterhci.io"
@@ -481,8 +482,30 @@ func (h *Handler) getAgentImage(ipPool *networkv1.IPPool) string {
 }
 
 func (h *Handler) forceDeletePod(namespace, name string) error {
-	opts := metav1.DeleteOptions{GracePeriodSeconds: pointer.Int64(0)}
-	return h.podClient.Delete(namespace, name, &opts)
+	pod, err := h.podClient.Get(namespace, name, &metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logrus.Infof("(ippool.forceDeletePod) Pod %s/%s not found, proceeding with deletion attempt", namespace, name)
+		} else {
+			logrus.Errorf("(ippool.forceDeletePod) Error getting pod %s/%s: %v", namespace, name, err)
+			return err
+		}
+	} else {
+		if len(pod.ObjectMeta.Finalizers) > 0 {
+			logrus.Infof("(ippool.forceDeletePod) Removing finalizers from pod %s/%s", namespace, name)
+			patchPayload := `[{"op": "replace", "path": "/metadata/finalizers", "value": []}]`
+			// Corrected Patch call: Added namespace, removed context.TODO()
+			_, patchErr := h.podClient.Patch(namespace, name, types.JSONPatchType, []byte(patchPayload), metav1.PatchOptions{})
+			if patchErr != nil {
+				logrus.Errorf("(ippool.forceDeletePod) Error patching pod %s/%s to remove finalizers: %v", namespace, name, patchErr)
+				// Continue to delete even if patch fails
+			}
+		}
+	}
+
+	logrus.Infof("(ippool.forceDeletePod) Deleting pod %s/%s", namespace, name)
+	deleteOpts := metav1.DeleteOptions{GracePeriodSeconds: pointer.Int64(0)}
+	return h.podClient.Delete(namespace, name, &deleteOpts)
 }
 
 func (h *Handler) cleanup(ipPool *networkv1.IPPool) error {
