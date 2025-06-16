@@ -5,6 +5,11 @@ import (
 	"fmt"
 	"reflect"
 
+	"context"
+	"fmt"
+	"reflect"
+	"time"
+
 	"github.com/rancher/wrangler/pkg/kv"
 	"github.com/rancher/wrangler/pkg/relatedresource"
 	"github.com/sirupsen/logrus"
@@ -429,36 +434,82 @@ func (h *Handler) MonitorAgent(ipPool *networkv1.IPPool, status networkv1.IPPool
 	logrus.Debugf("(ippool.MonitorAgent) monitor agent for ippool %s/%s", ipPool.Namespace, ipPool.Name)
 
 	if ipPool.Spec.Paused != nil && *ipPool.Spec.Paused {
+		status.AgentNotReadySince = nil // Clear timestamp if pool is paused
 		return status, fmt.Errorf("ippool %s/%s was administratively disabled", ipPool.Namespace, ipPool.Name)
 	}
 
 	if h.noAgent {
+		status.AgentNotReadySince = nil // Clear timestamp if no agent is used
 		return status, nil
 	}
 
 	if ipPool.Status.AgentPodRef == nil {
+		status.AgentNotReadySince = nil // Clear timestamp if no agent ref
 		return status, fmt.Errorf("agent for ippool %s/%s is not deployed", ipPool.Namespace, ipPool.Name)
 	}
 
 	agentPod, err := h.podCache.Get(ipPool.Status.AgentPodRef.Namespace, ipPool.Status.AgentPodRef.Name)
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logrus.Warnf("(ippool.MonitorAgent) agent pod %s/%s not found during monitoring. IPPool: %s/%s. Error: %v", ipPool.Status.AgentPodRef.Namespace, ipPool.Status.AgentPodRef.Name, ipPool.Namespace, ipPool.Name, err)
+			status.AgentNotReadySince = nil // Clear if pod not found
+		}
+		// For other errors, we don't modify AgentNotReadySince as the state is unknown
 		return status, err
 	}
 
+	// Check for obsolete pod (UID or image mismatch)
 	if agentPod.GetUID() != ipPool.Status.AgentPodRef.UID || agentPod.Spec.Containers[0].Image != ipPool.Status.AgentPodRef.Image {
 		if agentPod.DeletionTimestamp != nil {
+			// If pod is already marked for deletion, just report and wait.
 			return status, fmt.Errorf("agent pod %s marked for deletion", agentPod.Name)
 		}
 
+		logrus.Warnf("(ippool.MonitorAgent) Agent pod %s for IPPool %s/%s is obsolete (UID or image mismatch). Forcing deletion.", agentPod.Name, ipPool.Namespace, ipPool.Name)
 		if err := h.forceDeletePod(agentPod.Namespace, agentPod.Name); err != nil {
-			return status, err
+			// If forceDeletePod fails, return the error. AgentNotReadySince remains as is or nil.
+			return status, fmt.Errorf("failed to force delete obsolete agent pod %s: %v", agentPod.Name, err)
 		}
-
+		status.AgentNotReadySince = nil // Clear timestamp as we are deleting the pod
+		h.ippoolController.Enqueue(ipPool.Namespace, ipPool.Name) // Re-enqueue to deploy a new one
 		return status, fmt.Errorf("agent pod %s obsolete and purged", agentPod.Name)
 	}
 
 	if !isPodReady(agentPod) {
-		return status, fmt.Errorf("agent pod %s not ready", agentPod.Name)
+		errorMessage := fmt.Sprintf("agent pod %s not ready", agentPod.Name)
+		logrus.Warnf("(ippool.MonitorAgent) %s for IPPool %s/%s. Conditions: %+v", errorMessage, ipPool.Namespace, ipPool.Name, agentPod.Status.Conditions)
+
+		if status.AgentNotReadySince == nil {
+			now := metav1.Now()
+			status.AgentNotReadySince = &now
+			logrus.Infof("(ippool.MonitorAgent) Agent pod %s for IPPool %s/%s first detected as not ready at %s", agentPod.Name, ipPool.Namespace, ipPool.Name, now.Format(time.RFC3339))
+			return status, fmt.Errorf(errorMessage) // Requeue to persist AgentNotReadySince
+		}
+
+		// unreadyThreshold could be a constant or configurable.
+		// For now, 90 seconds as per the example.
+		const unreadyThreshold = 90 * time.Second
+		notReadyDuration := time.Since(status.AgentNotReadySince.Time)
+		logrus.Debugf("(ippool.MonitorAgent) Agent pod %s for IPPool %s/%s has been not ready for %s", agentPod.Name, ipPool.Namespace, ipPool.Name, notReadyDuration.String())
+
+		if notReadyDuration > unreadyThreshold {
+			logrus.Warnf("(ippool.MonitorAgent) Agent pod %s for IPPool %s/%s has been not ready for over %s (duration: %s). Forcing deletion.", agentPod.Name, ipPool.Namespace, ipPool.Name, unreadyThreshold.String(), notReadyDuration.String())
+			if errDel := h.forceDeletePod(agentPod.Namespace, agentPod.Name); errDel != nil {
+				// If forceDeletePod fails, return the error. AgentNotReadySince remains.
+				return status, fmt.Errorf("failed to force delete unready agent pod %s: %v", agentPod.Name, errDel)
+			}
+			status.AgentNotReadySince = nil // Clear timestamp as we've deleted the pod
+			h.ippoolController.Enqueue(ipPool.Namespace, ipPool.Name) // Re-enqueue to deploy a new one
+			return status, fmt.Errorf("unready agent pod %s purged after %s", agentPod.Name, unreadyThreshold.String())
+		}
+
+		return status, fmt.Errorf(errorMessage+" (unready duration %s, threshold %s)", notReadyDuration.String(), unreadyThreshold.String())
+	}
+
+	// If pod is ready, clear the AgentNotReadySince timestamp if it was set
+	if status.AgentNotReadySince != nil {
+		logrus.Infof("(ippool.MonitorAgent) Agent pod %s for IPPool %s/%s has recovered and is now ready.", agentPod.Name, ipPool.Namespace, ipPool.Name)
+		status.AgentNotReadySince = nil
 	}
 
 	return status, nil

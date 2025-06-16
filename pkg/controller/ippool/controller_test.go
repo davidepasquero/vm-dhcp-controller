@@ -1086,3 +1086,295 @@ func TestHandler_MonitorAgent(t *testing.T) {
 		// If this test suite had consistent fake client behavior for deletes (e.g., actual removal from tracker), this could be enabled.
 	})
 }
+
+// mockIPPoolController is a mock implementation of ctlnetworkv1.IPPoolController for testing Enqueue calls.
+type mockIPPoolController struct {
+	ctlnetworkv1.IPPoolController // Embed the interface to satisfy it. Only Enqueue is mocked.
+
+	enqueueCalled     bool
+	enqueuedNamespace string
+	enqueuedName      string
+}
+
+func (m *mockIPPoolController) Enqueue(namespace, name string) {
+	m.enqueueCalled = true
+	m.enqueuedNamespace = namespace
+	m.enqueuedName = name
+}
+
+// Ensure mockIPPoolController implements the interface - this line can be commented out if it causes compile issues in the tool environment
+var _ ctlnetworkv1.IPPoolController = &mockIPPoolController{}
+
+const monitorAgentUnreadyThreshold = 90 * time.Second
+
+func TestMonitorAgent_Scenarios(t *testing.T) {
+	testIPPool := newTestIPPoolBuilder().Build() // Uses testIPPoolNamespace & testIPPoolName
+	agentPodRef := &networkv1.PodReference{
+		Namespace: testPodNamespace,
+		Name:      testPodName,
+		Image:     testImage,
+		UID:       types.UID(testUID),
+	}
+	// Assign to a copy of testIPPool to avoid modifying the global one if newTestIPPoolBuilder().Build() returns a shared instance
+	currentTestIPPool := testIPPool.DeepCopy()
+	currentTestIPPool.Status.AgentPodRef = agentPodRef
+
+
+	baseAgentPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agentPodRef.Name,
+			Namespace: agentPodRef.Namespace,
+			UID:       agentPodRef.UID,
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "agent", Image: agentPodRef.Image}},
+		},
+		Status: corev1.PodStatus{ // Default to ready
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+
+	tests := []struct {
+		name                     string
+		initialStatus            networkv1.IPPoolStatus
+		podSetup                 func(pod *corev1.Pod) // Modifies baseAgentPod for the scenario
+		k8sClientSetup           func(fakeClient *k8sfake.Clientset, podToReturn *corev1.Pod) // For complex client mocks
+		expectedErr              bool
+		expectedErrMsgContains   string
+		expectedAgentNotReadyNil bool
+		expectedAgentNotReadySet bool
+		expectForceDelete        bool
+		expectEnqueue            bool
+	}{
+		{
+			name:                     "AgentHealthy_WasNeverUnready",
+			initialStatus:            networkv1.IPPoolStatus{AgentPodRef: agentPodRef, AgentNotReadySince: nil},
+			podSetup:                 func(pod *corev1.Pod) { /* default ready pod */ },
+			expectedErr:              false,
+			expectedAgentNotReadyNil: true,
+		},
+		{
+			name: "AgentHealthy_Recovers",
+			initialStatus: networkv1.IPPoolStatus{
+				AgentPodRef:        agentPodRef,
+				AgentNotReadySince: func() *metav1.Time { tV := metav1.Now(); return &tV }(), // Was unready
+			},
+			podSetup:                 func(pod *corev1.Pod) { /* default ready pod */ },
+			expectedErr:              false,
+			expectedAgentNotReadyNil: true, // Should be cleared
+		},
+		{
+			name:          "AgentBecomesUnready_FirstTime",
+			initialStatus: networkv1.IPPoolStatus{AgentPodRef: agentPodRef, AgentNotReadySince: nil},
+			podSetup: func(pod *corev1.Pod) {
+				pod.Status.Conditions = []corev1.PodCondition{
+					{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+				}
+			},
+			expectedErr:              true,
+			expectedErrMsgContains:   fmt.Sprintf("agent pod %s not ready", agentPodRef.Name),
+			expectedAgentNotReadySet: true,
+		},
+		{
+			name: "AgentUnready_BelowThreshold",
+			initialStatus: networkv1.IPPoolStatus{
+				AgentPodRef:        agentPodRef,
+				AgentNotReadySince: func() *metav1.Time { tV := metav1.NewTime(time.Now().Add(-30 * time.Second)); return &tV }(),
+			},
+			podSetup: func(pod *corev1.Pod) {
+				pod.Status.Conditions = []corev1.PodCondition{
+					{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+				}
+			},
+			expectedErr:              true,
+			expectedErrMsgContains:   fmt.Sprintf("agent pod %s not ready", agentPodRef.Name),
+			expectedAgentNotReadyNil: false,
+		},
+		{
+			name: "AgentUnready_AboveThreshold",
+			initialStatus: networkv1.IPPoolStatus{
+				AgentPodRef:        agentPodRef,
+				AgentNotReadySince: func() *metav1.Time { tV := metav1.NewTime(time.Now().Add(-(monitorAgentUnreadyThreshold + 30*time.Second))); return &tV }(),
+			},
+			podSetup: func(pod *corev1.Pod) {
+				pod.Status.Conditions = []corev1.PodCondition{
+					{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+				}
+			},
+			expectedErr:              true,
+			expectedErrMsgContains:   fmt.Sprintf("unready agent pod %s purged after", agentPodRef.Name),
+			expectedAgentNotReadyNil: true,
+			expectForceDelete:        true,
+			expectEnqueue:            true,
+		},
+		{
+			name: "AgentPodNotFound",
+			initialStatus: networkv1.IPPoolStatus{
+				AgentPodRef:        agentPodRef,
+				AgentNotReadySince: func() *metav1.Time { tV := metav1.Now(); return &tV }(),
+			},
+			podSetup: func(pod *corev1.Pod) { /* pod won't be returned by Get */ },
+			k8sClientSetup: func(fakeClient *k8sfake.Clientset, podToReturn *corev1.Pod) {
+				fakeClient.Fake.PrependReactor("get", "pods", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+					getAction := action.(k8stesting.GetAction)
+					if getAction.GetNamespace() == agentPodRef.Namespace && getAction.GetName() == agentPodRef.Name {
+						return true, nil, apierrors.NewNotFound(corev1.Resource("pods"), agentPodRef.Name)
+					}
+					return false, nil, nil // Fallback for other gets like in forceDeletePod
+				})
+			},
+			expectedErr:              true,
+			expectedErrMsgContains:   "not found", // Error from apierrors.NewNotFound
+			expectedAgentNotReadyNil: true,
+		},
+		{
+			name: "AgentPodObsolete_UIDMismatch",
+			initialStatus: networkv1.IPPoolStatus{
+				AgentPodRef:        agentPodRef,
+				AgentNotReadySince: func() *metav1.Time { tV := metav1.Now(); return &tV }(),
+			},
+			podSetup: func(pod *corev1.Pod) {
+				pod.UID = "different-uid"
+			},
+			expectedErr:              true,
+			expectedErrMsgContains:   "obsolete and purged",
+			expectedAgentNotReadyNil: true,
+			expectForceDelete:        true,
+			expectEnqueue:            true,
+		},
+		{
+			name: "AgentPodObsolete_ImageMismatch",
+			initialStatus: networkv1.IPPoolStatus{
+				AgentPodRef:        agentPodRef,
+				AgentNotReadySince: func() *metav1.Time { tV := metav1.Now(); return &tV }(),
+			},
+			podSetup: func(pod *corev1.Pod) {
+				pod.Spec.Containers[0].Image = "different/image:latest"
+			},
+			expectedErr:              true,
+			expectedErrMsgContains:   "obsolete and purged",
+			expectedAgentNotReadyNil: true,
+			expectForceDelete:        true,
+			expectEnqueue:            true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			currentPodState := baseAgentPod.DeepCopy()
+			if tt.podSetup != nil {
+				tt.podSetup(currentPodState)
+			}
+
+			// Initial objects for the fake client. Add pod only if it's supposed to be found.
+			var initialK8sObjects []runtime.Object
+			if tt.name != "AgentPodNotFound" { // In "AgentPodNotFound", Get should fail.
+				initialK8sObjects = append(initialK8sObjects, currentPodState.DeepCopy())
+			}
+			fakeK8sClient := k8sfake.NewSimpleClientset(initialK8sObjects...)
+
+			mockCtrl := &mockIPPoolController{}
+			h := &Handler{
+				podCache:         fakeclient.PodCache(fakeK8sClient.CoreV1().Pods),
+				podClient:        fakeclient.PodClient(fakeK8sClient.CoreV1().Pods),
+				ippoolController: mockCtrl,
+			}
+
+			var deleteActionCalledOnPod bool
+
+			// Specific Get reactor for the main MonitorAgent logic (h.podCache.Get)
+			// This is added first to the chain of reactors for "get" "pods".
+			// Note: k8s testing reactors are LIFO. So this will be called *after* generic ones below if not careful.
+			// For this test, we will ensure this is the dominant Get reactor for the specific pod.
+			getCallCount := 0
+			fakeK8sClient.Fake.PrependReactor("get", "pods", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+				getCallCount++
+				getAction := action.(k8stesting.GetAction)
+				if getAction.GetNamespace() == agentPodRef.Namespace && getAction.GetName() == agentPodRef.Name {
+					if tt.name == "AgentPodNotFound" {
+						return true, nil, apierrors.NewNotFound(corev1.Resource("pods"), agentPodRef.Name)
+					}
+					// For forceDeletePod's Get, if delete was called, it should be not found.
+					if deleteActionCalledOnPod && tt.expectForceDelete {
+                         return true, nil, apierrors.NewNotFound(corev1.Resource("pods"), agentPodRef.Name)
+                    }
+					return true, currentPodState.DeepCopy(), nil
+				}
+				// Fallback for any other Get calls, e.g. if forceDeletePod tries to Get a different pod (not expected here)
+				return true, nil, apierrors.NewNotFound(corev1.Resource("pods"), getAction.GetName())
+			})
+
+
+			if tt.k8sClientSetup != nil {
+				tt.k8sClientSetup(fakeK8sClient, currentPodState)
+			}
+
+			// Reactor for DELETE (to check forceDeletePod calls)
+			fakeK8sClient.Fake.PrependReactor("delete", "pods", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+				deleteAction := action.(k8stesting.DeleteActionImpl) // Use Impl to get GracePeriodSeconds
+				if deleteAction.GetNamespace() == agentPodRef.Namespace && deleteAction.GetName() == agentPodRef.Name {
+					assert.NotNil(t, deleteAction.GetDeleteOptions().GracePeriodSeconds, "Delete: GracePeriodSeconds is nil")
+					assert.EqualValues(t, 0, *deleteAction.GetDeleteOptions().GracePeriodSeconds, "Delete: GracePeriodSeconds mismatch")
+					deleteActionCalledOnPod = true
+					// Simulate pod actually being deleted for subsequent Get calls in forceDeletePod
+					// This is tricky with the simple tracker; often forceDeletePod's Get would still find it.
+					// The Get reactor above handles this by returning NotFound if deleteActionCalledOnPod is true.
+					return true, nil, nil
+				}
+				return false, nil, nil
+			})
+
+			// Reactor for PATCH (for forceDeletePod's finalizer removal)
+			fakeK8sClient.Fake.PrependReactor("patch", "pods", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+				patchAction := action.(k8stesting.PatchAction)
+				if patchAction.GetNamespace() == agentPodRef.Namespace && patchAction.GetName() == agentPodRef.Name {
+					// Return a pod with finalizers removed
+					p := currentPodState.DeepCopy()
+					p.Finalizers = nil // Simulate finalizer removal
+					return true, p, nil
+				}
+				return false, nil, nil
+			})
+
+			// Pass a copy of the IPPool with the correct status for the test case
+			poolForTest := currentTestIPPool.DeepCopy()
+			statusForTest := tt.initialStatus.DeepCopy() // Ensure we use a copy of the initial status for each run
+			poolForTest.Status = *statusForTest // The MonitorAgent receives the IPPool object, not just status.
+
+			returnedStatus, err := h.MonitorAgent(poolForTest, *statusForTest)
+
+			if tt.expectedErr {
+				assert.Error(t, err, "Expected an error in test: "+tt.name)
+				if tt.expectedErrMsgContains != "" {
+					assert.Contains(t, err.Error(), tt.expectedErrMsgContains, "Error message mismatch in test: "+tt.name)
+				}
+			} else {
+				assert.NoError(t, err, "Expected no error in test: "+tt.name)
+			}
+
+			if tt.expectedAgentNotReadyNil {
+				assert.Nil(t, returnedStatus.AgentNotReadySince, "AgentNotReadySince should be nil in test: "+tt.name)
+			} else if tt.expectedAgentNotReadySet {
+				assert.NotNil(t, returnedStatus.AgentNotReadySince, "AgentNotReadySince should be set in test: "+tt.name)
+				if tt.name == "AgentBecomesUnready_FirstTime" { // Ensure it's a recent time
+					assert.True(t, time.Since(returnedStatus.AgentNotReadySince.Time) < 5*time.Second, "AgentNotReadySince not set to recent time in test: "+tt.name)
+				}
+			} else {
+				// Should be non-nil and same as initial (e.g. AgentUnready_BelowThreshold)
+				assert.NotNil(t, returnedStatus.AgentNotReadySince, "AgentNotReadySince should not be nil in test: "+tt.name)
+				if tt.initialStatus.AgentNotReadySince != nil { // Compare if initial was set
+					assert.Equal(t, tt.initialStatus.AgentNotReadySince.Time.Unix(), returnedStatus.AgentNotReadySince.Time.Unix(), "AgentNotReadySince mismatch from initial in test: "+tt.name)
+				}
+			}
+
+			assert.Equal(t, tt.expectForceDelete, deleteActionCalledOnPod, "forceDeletePod call expectation mismatch in test: "+tt.name)
+			assert.Equal(t, tt.expectEnqueue, mockCtrl.enqueueCalled, "ippoolController.Enqueue call expectation mismatch in test: "+tt.name)
+			if tt.expectEnqueue {
+				assert.Equal(t, poolForTest.Namespace, mockCtrl.enqueuedNamespace, "Enqueue namespace mismatch in test: "+tt.name)
+				assert.Equal(t, poolForTest.Name, mockCtrl.enqueuedName, "Enqueue name mismatch in test: "+tt.name)
+			}
+		})
+	}
+}

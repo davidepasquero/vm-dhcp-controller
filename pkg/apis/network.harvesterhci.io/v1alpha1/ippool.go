@@ -124,6 +124,11 @@ type IPPoolStatus struct {
 	// +optional
 	// +kubebuilder:validation:Optional
 	Conditions []genericcondition.GenericCondition `json:"conditions,omitempty"`
+
+	// AgentNotReadySince stores the timestamp of when the agent pod was first detected as not ready.
+	// Cleared when the agent becomes ready or is deleted.
+	// +optional
+	AgentNotReadySince *metav1.Time `json:"agentNotReadySince,omitempty"`
 }
 
 type IPv4Status struct {
