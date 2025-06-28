@@ -12,6 +12,9 @@ IMAGE=${REPO}/vm-dhcp-controller:${TAG}
 DOCKERFILE=package/Dockerfile
 
 buildx build --load \
+  --build-arg http_proxy="${http_proxy}" \
+  --build-arg https_proxy="${https_proxy}" \
+  --build-arg no_proxy="${no_proxy}" \
   -f ${DOCKERFILE} -t ${IMAGE} .
 echo Built ${IMAGE}
 
