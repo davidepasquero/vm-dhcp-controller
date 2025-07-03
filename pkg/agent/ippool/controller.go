@@ -85,21 +85,29 @@ func (c *Controller) sync(event Event) (err error) {
 	}
 
 	switch event.action {
-	case UPDATE:
+	case ADD, UPDATE: // Handle ADD and UPDATE identically for cache priming
 		ipPool, ok := obj.(*networkv1.IPPool)
 		if !ok {
-			logrus.Error("(controller.sync) failed to assert obj during UPDATE")
+			logrus.Errorf("(controller.sync) failed to assert obj during %s event for key %s", event.action, event.key)
+			return nil // Don't requeue if type assertion fails
 		}
-		logrus.Infof("(controller.sync) UPDATE %s/%s", ipPool.Namespace, ipPool.Name)
+		logrus.Infof("(controller.sync) %s %s/%s", event.action, ipPool.Namespace, ipPool.Name)
 		if err := c.Update(ipPool); err != nil {
-			logrus.Errorf("(controller.sync) failed to update DHCP lease store for IPPool %s/%s: %s", ipPool.Namespace, ipPool.Name, err.Error())
+			logrus.Errorf("(controller.sync) failed to update DHCP lease store for IPPool %s/%s during %s event: %s", ipPool.Namespace, ipPool.Name, event.action, err.Error())
 			return err // Return error to requeue
 		}
 		// If update was successful, this is a good place to signal initial sync
+		// This will be called for the first ADD or UPDATE event that successfully processes.
 		c.initialSyncOnce.Do(func() {
-			logrus.Infof("Initial sync completed for IPPool %s/%s, signaling DHCP server.", ipPool.Namespace, ipPool.Name)
+			logrus.Infof("Initial sync processing completed for IPPool %s/%s (triggered by %s event), signaling DHCP server.", ipPool.Namespace, ipPool.Name, event.action)
 			close(c.initialSyncDone)
 		})
+	// Potentially handle DELETE if needed in the future
+	// case DELETE:
+	// logrus.Infof("(controller.sync) DELETE %s", event.key)
+	// // Perform cleanup if necessary, e.g., clearing leases from dhcpAllocator
+	// // if this agent is supposed to stop serving this pool.
+	// // However, for a single watched IPPool, deletion might mean the agent has no work.
 	}
 
 	return

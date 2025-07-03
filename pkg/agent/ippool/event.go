@@ -105,17 +105,34 @@ func (e *EventHandler) EventListener(ctx context.Context) {
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
 	indexer, informer := cache.NewIndexerInformer(watcher, &networkv1.IPPool{}, 0, cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			key, err := cache.MetaNamespaceKeyFunc(obj)
+			if err == nil {
+				ipPool := obj.(*networkv1.IPPool)
+				queue.Add(Event{
+					key:             key,
+					action:          ADD, // Use ADD action
+					poolName:        ipPool.ObjectMeta.Name,
+					poolNetworkName: ipPool.Spec.NetworkName,
+				})
+				logrus.Debugf("(eventhandler.EventListener) AddFunc: Queued ADD event for IPPool %s", key)
+			}
+		},
 		UpdateFunc: func(old interface{}, new interface{}) {
 			key, err := cache.MetaNamespaceKeyFunc(new)
 			if err == nil {
+				ipPool := new.(*networkv1.IPPool)
 				queue.Add(Event{
 					key:             key,
 					action:          UPDATE,
-					poolName:        new.(*networkv1.IPPool).ObjectMeta.Name,
-					poolNetworkName: new.(*networkv1.IPPool).Spec.NetworkName,
+					poolName:        ipPool.ObjectMeta.Name,
+					poolNetworkName: ipPool.Spec.NetworkName,
 				})
+				logrus.Debugf("(eventhandler.EventListener) UpdateFunc: Queued UPDATE event for IPPool %s", key)
 			}
 		},
+		// Consider adding DeleteFunc if agent needs to react to IPPool deletion,
+		// though for a single watched IPPool, this might mean the agent stops.
 	}, cache.Indexers{})
 
 	controller := NewController(queue, indexer, informer, e.poolRef, e.dhcpAllocator, e.poolCache, e.InitialSyncDone, &e.initialSyncOnce)
