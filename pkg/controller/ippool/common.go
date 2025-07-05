@@ -21,7 +21,7 @@ import (
 	"github.com/harvester/vm-dhcp-controller/pkg/util"
 )
 
-const agentReplicas int32 = 2
+const defaultAgentReplicas int32 = 2
 
 func prepareAgentPod(
 	ipPool *networkv1.IPPool,
@@ -179,7 +179,7 @@ func prepareAgentDeployment(
 			Labels:    pod.Labels,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: pointer.Int32(agentReplicas),
+			Replicas: pointer.Int32(defaultAgentReplicas),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: pod.Labels,
 			},
