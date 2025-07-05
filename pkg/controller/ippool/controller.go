@@ -22,7 +22,8 @@ import (
 	// appsv1 "k8s.io/api/apps/v1" // Unused
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	// metav1 "k8s.io/apimachinery/pkg/apis/meta/v1" // This was the duplicate
-	corev1 "k8s.io/api/core/v1"                   // For EnvVar
+	corev1 "k8s.io/api/core/v1" // For EnvVar
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes"
 	// "encoding/json" // Unused
 	"os"      // For os.Getenv
@@ -412,20 +413,239 @@ func (h *Handler) reconcileAgentForIPPool(ipPool *networkv1.IPPool) error {
 	// --- Reconcile Agent Deployment ---
 	// This part is complex and involves defining the full Deployment spec.
 	// For brevity, only logging for now. Full implementation would mirror chart/templates/agent-deployment.yaml.
-	logrus.Infof("TODO: Reconcile Agent Deployment %s/%s for IPPool %s/%s", agentResourceNamespace, agentDepName, ipPool.Namespace, ipPool.Name)
-	// Example of what needs to be done:
-	// desiredDeployment := constructDesiredAgentDeployment(ipPool, agentDepName, agentSAName, agentResourceNamespace, h.getAgentContainerName())
-	// existingDeployment, err := h.kubeClient.AppsV1().Deployments(agentResourceNamespace).Get(ctx, agentDepName, metav1.GetOptions{})
-	// if k8serrors.IsNotFound(err) {
-	//    _, err = h.kubeClient.AppsV1().Deployments(agentResourceNamespace).Create(ctx, desiredDeployment, metav1.CreateOptions{})
-	// } else if err == nil {
-	//    if needsUpdate(existingDeployment, desiredDeployment) {
-	//       _, err = h.kubeClient.AppsV1().Deployments(agentResourceNamespace).Update(ctx, desiredDeployment, metav1.UpdateOptions{})
-	//    }
-	// }
-	// if err != nil { ... handle error ... }
+	// logrus.Infof("TODO: Reconcile Agent Deployment %s/%s for IPPool %s/%s", agentResourceNamespace, agentDepName, ipPool.Namespace, ipPool.Name)
+	desiredDeployment, err := h.constructDesiredAgentDeployment(ipPool, agentDepName, agentSAName, agentResourceNamespace)
+	if err != nil {
+		return fmt.Errorf("failed to construct desired agent deployment: %w", err)
+	}
+
+	existingDeployment, err := h.kubeClient.AppsV1().Deployments(agentResourceNamespace).Get(ctx, agentDepName, metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			logrus.Infof("Agent Deployment %s/%s not found, creating.", agentResourceNamespace, agentDepName)
+			_, err = h.kubeClient.AppsV1().Deployments(agentResourceNamespace).Create(ctx, desiredDeployment, metav1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to create agent Deployment %s/%s: %w", agentResourceNamespace, agentDepName, err)
+			}
+			logrus.Infof("Created agent Deployment %s/%s", agentResourceNamespace, agentDepName)
+		} else {
+			return fmt.Errorf("failed to get agent Deployment %s/%s: %w", agentResourceNamespace, agentDepName, err)
+		}
+	} else {
+		if needsUpdate(existingDeployment, desiredDeployment) {
+			logrus.Infof("Agent Deployment %s/%s needs update, updating.", agentResourceNamespace, agentDepName)
+			_, err = h.kubeClient.AppsV1().Deployments(agentResourceNamespace).Update(ctx, desiredDeployment, metav1.UpdateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to update agent Deployment %s/%s: %w", agentResourceNamespace, agentDepName, err)
+			}
+			logrus.Infof("Updated agent Deployment %s/%s", agentResourceNamespace, agentDepName)
+		} else {
+			logrus.Debugf("Agent Deployment %s/%s already up-to-date.", agentResourceNamespace, agentDepName)
+		}
+	}
 
 	return nil
+}
+
+// needsUpdate compares key fields of two Deployments to determine if an update is necessary.
+func needsUpdate(existing, desired *appsv1.Deployment) bool {
+	// Compare Replicas
+	if existing.Spec.Replicas != nil && desired.Spec.Replicas != nil && *existing.Spec.Replicas != *desired.Spec.Replicas {
+		logrus.Debugf("needsUpdate: Replicas changed from %d to %d", *existing.Spec.Replicas, *desired.Spec.Replicas)
+		return true
+	}
+
+	// Compare Pod Template Spec (simplified check, more granular checks can be added)
+	// Check container image
+	if len(existing.Spec.Template.Spec.Containers) != len(desired.Spec.Template.Spec.Containers) {
+		logrus.Debugf("needsUpdate: Container count changed from %d to %d", len(existing.Spec.Template.Spec.Containers), len(desired.Spec.Template.Spec.Containers))
+		return true // Should not happen if we only manage one container
+	}
+	if len(desired.Spec.Template.Spec.Containers) > 0 { // Ensure there's at least one container defined
+		if existing.Spec.Template.Spec.Containers[0].Image != desired.Spec.Template.Spec.Containers[0].Image {
+			logrus.Debugf("needsUpdate: Container image changed from %s to %s", existing.Spec.Template.Spec.Containers[0].Image, desired.Spec.Template.Spec.Containers[0].Image)
+			return true
+		}
+
+		// Compare Environment Variables (order doesn't matter for equality, but DeepEqual handles it)
+		if !reflect.DeepEqual(existing.Spec.Template.Spec.Containers[0].Env, desired.Spec.Template.Spec.Containers[0].Env) {
+			logrus.Debugf("needsUpdate: Environment variables changed.")
+			// For more detailed logging, you could iterate and print diffs.
+			// Example: logrus.Debugf("Existing Env: %+v, Desired Env: %+v", existing.Spec.Template.Spec.Containers[0].Env, desired.Spec.Template.Spec.Containers[0].Env)
+			return true
+		}
+
+		// Compare Resource Requirements
+		if !reflect.DeepEqual(existing.Spec.Template.Spec.Containers[0].Resources, desired.Spec.Template.Spec.Containers[0].Resources) {
+			logrus.Debugf("needsUpdate: Resource requirements changed.")
+			return true
+		}
+
+		// Compare Args
+		if !reflect.DeepEqual(existing.Spec.Template.Spec.Containers[0].Args, desired.Spec.Template.Spec.Containers[0].Args) {
+			logrus.Debugf("needsUpdate: Container args changed.")
+			return true
+		}
+	}
+
+
+	// Compare Labels (on Deployment and PodTemplate)
+	if !reflect.DeepEqual(existing.ObjectMeta.Labels, desired.ObjectMeta.Labels) {
+		logrus.Debugf("needsUpdate: Deployment labels changed.")
+		return true
+	}
+	if !reflect.DeepEqual(existing.Spec.Template.ObjectMeta.Labels, desired.Spec.Template.ObjectMeta.Labels) {
+		logrus.Debugf("needsUpdate: Pod template labels changed.")
+		return true
+	}
+
+	// Compare Annotations (on Deployment and PodTemplate)
+	// Note: Some annotations are set by Kubernetes itself (e.g., deployment.kubernetes.io/revision).
+	// We should only compare annotations we manage or care about.
+	// For simplicity, a full DeepEqual might be too sensitive.
+	// Let's check specific annotations like the Multus one.
+	if existing.Spec.Template.ObjectMeta.Annotations[multusNetworksAnnotationKey] != desired.Spec.Template.ObjectMeta.Annotations[multusNetworksAnnotationKey] {
+		logrus.Debugf("needsUpdate: Multus annotation changed from %s to %s", existing.Spec.Template.ObjectMeta.Annotations[multusNetworksAnnotationKey], desired.Spec.Template.ObjectMeta.Annotations[multusNetworksAnnotationKey])
+		return true
+	}
+	// A more robust way for annotations would be to check if all desired annotations are present and correct in existing.
+
+	// Compare ServiceAccountName in PodSpec
+	if existing.Spec.Template.Spec.ServiceAccountName != desired.Spec.Template.Spec.ServiceAccountName {
+		logrus.Debugf("needsUpdate: ServiceAccountName changed from %s to %s", existing.Spec.Template.Spec.ServiceAccountName, desired.Spec.Template.Spec.ServiceAccountName)
+		return true
+	}
+
+	// Add more checks as needed (e.g., volumes, security contexts, etc.)
+
+	return false
+}
+
+// Helper function to get agent container name from environment variable or use a default
+func getAgentContainerName() string {
+	name := os.Getenv("AGENT_CONTAINER_NAME")
+	if name == "" {
+		name = "vm-dhcp-agent" // Default container name
+	}
+	return name
+}
+
+// Helper function to get agent image from environment variable or use a default
+func getAgentImage() string {
+	image := os.Getenv("AGENT_IMAGE")
+	if image == "" {
+		// This should ideally be set to a valid default image for the agent
+		// For example: "your-repo/vm-dhcp-agent:latest"
+		// Using a placeholder as it's critical this is configured correctly.
+		logrus.Error("AGENT_IMAGE environment variable is not set and no default is defined.")
+		// Returning a dummy value, but this should cause issues if not configured.
+		return "placeholder-agent-image:latest"
+	}
+	return image
+}
+
+func (h *Handler) constructDesiredAgentDeployment(
+	ipPool *networkv1.IPPool,
+	deploymentName string,
+	saName string,
+	namespace string,
+) (*appsv1.Deployment, error) {
+	agentContainerName := getAgentContainerName()
+	agentImage := getAgentImage()
+	replicas := int32(1) // Agent deployments are typically single replica
+
+	// Define labels for the Deployment and its Pods
+	// These labels help in selecting/identifying the agent pods
+	labels := map[string]string{
+		"app.kubernetes.io/name":       "vm-dhcp-agent",
+		"app.kubernetes.io/instance":   deploymentName,
+		network.GroupName + "/ippool":  fmt.Sprintf("%s.%s", ipPool.Namespace, ipPool.Name), // Label with IPPool it serves
+		"original-ippool-namespace":    sanitizeNameForKubernetes(ipPool.Namespace),
+		"original-ippool-name":         sanitizeNameForKubernetes(ipPool.Name),
+	}
+
+	// Define annotations, including the Multus NAD annotation
+	// The NAD name must match how it's created/available in the cluster.
+	// Assuming ipPool.Spec.NetworkName is the NAD <namespace>/<name>
+	nadNamespace, nadName := kv.RSplit(ipPool.Spec.NetworkName, "/")
+	if nadNamespace == "" { // If no namespace in NetworkName, assume it's in the agent's namespace
+		nadNamespace = namespace
+	}
+	nadAnnotationValue := fmt.Sprintf(`[{"name": "%s/%s", "namespace": "%s", "interface": "%s"}]`,
+		nadNamespace,
+		nadName,
+		nadNamespace, // The NAD object's namespace
+		DefaultAgentPodInterfaceName, // e.g., "net1"
+	)
+
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      deploymentName,
+			Namespace: namespace,
+			Labels:    labels,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(ipPool, networkv1.SchemeGroupVersion.WithKind("IPPool")),
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels, // Selector should match pod labels
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels, // Pod labels
+					Annotations: map[string]string{
+						multusNetworksAnnotationKey: nadAnnotationValue,
+					},
+				},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: saName,
+					Containers: []corev1.Container{
+						{
+							Name:  agentContainerName,
+							Image: agentImage,
+							Args: []string{
+								"agent", // Assuming the agent binary takes "agent" as subcommand
+								"--ippool-name", ipPool.Name,
+								"--ippool-namespace", ipPool.Namespace,
+								// Add other necessary agent flags here
+							},
+							Env: []corev1.EnvVar{
+								{Name: "AGENT_NAMESPACE", Value: namespace},
+								{Name: "IPPOOL_NAME", Value: ipPool.Name},
+								{Name: "IPPOOL_NAMESPACE", Value: ipPool.Namespace},
+								{Name: "POD_IPPOOL_NETWORK_NAME", Value: ipPool.Spec.NetworkName}, // For agent to know which NAD it's attached to
+								// Potentially pass DHCP server IP, lease times etc. if agent needs them directly
+								// Or agent can fetch IPPool object itself using its SA permissions.
+							},
+							// Define Resources, Probes, VolumeMounts as needed
+							// Example Resources (should be configurable)
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("200m"),
+									corev1.ResourceMemory: resource.MustParse("256Mi"),
+								},
+							},
+							SecurityContext: &corev1.SecurityContext{
+								Capabilities: &corev1.Capabilities{
+									Add: []corev1.Capability{"NET_ADMIN", "NET_RAW"}, // For DHCP server operations
+								},
+							},
+						},
+					},
+					// Define NodeSelector, Affinity, Tolerations if needed
+					// Example: Node affinity to run agent on nodes where the network (NAD) is available
+					// This depends on how network attachments are managed (e.g. if NADs are node-specific)
+				},
+			},
+		},
+	}
+	return deployment, nil
 }
 
 
