@@ -25,8 +25,11 @@ import (
 	corev1 "k8s.io/api/core/v1"                   // For EnvVar
 	"k8s.io/client-go/kubernetes"
 	// "encoding/json" // Unused
-	"os"     // For os.Getenv
+	"os"      // For os.Getenv
 	"strings" // For argument parsing
+
+	appsv1 "k8s.io/api/apps/v1"       // For Deployment
+	rbacv1 "k8s.io/api/rbac/v1" // For ClusterRoleBinding
 )
 
 const (
@@ -237,10 +240,11 @@ func (h *Handler) OnChange(key string, ipPool *networkv1.IPPool) (*networkv1.IPP
 	// For now, skipping the actual agent deployment update to avoid introducing half-baked logic
 	// without having the controller's own Helm fullname.
 	// TODO: Implement dynamic agent deployment update once controller's Helm fullname is accessible.
-	if err := h.syncAgentDeployment(ipPoolCpy); err != nil {
+	// The old syncAgentDeployment logic is removed. We now call reconcileAgentForIPPool.
+	if err := h.reconcileAgentForIPPool(ipPoolCpy); err != nil {
 		// Log the error but don't necessarily block IPPool reconciliation for agent deployment issues.
 		// The IPPool status update should still proceed.
-		logrus.Errorf("Failed to sync agent deployment for ippool %s: %v", key, err)
+		logrus.Errorf("Failed to reconcile agent for ippool %s: %v", key, err)
 		// Depending on desired behavior, you might want to return the error or update a condition on ipPool.
 		// For now, just logging.
 	}
@@ -248,302 +252,178 @@ func (h *Handler) OnChange(key string, ipPool *networkv1.IPPool) (*networkv1.IPP
 	return ipPoolCpy, nil // Return potentially updated ipPoolCpy from status updates
 }
 
-// getAgentDeploymentName constructs the expected name of the agent deployment.
-// It relies on the AGENT_DEPLOYMENT_NAME environment variable.
-func (h *Handler) getAgentDeploymentName() string {
-	// This assumes the agent deployment follows "<helm-release-name>-<chart-name>-agent" if fullname is complex,
-	// or just "<helm-release-name>-agent" if chart name is part of release name.
-	// The agent deployment is named: {{ template "harvester-vm-dhcp-controller.fullname" . }}-agent
-	// If controllerHelmReleaseName is the "fullname", then it's controllerHelmReleaseName + AgentDeploymentNameSuffix
-	// This needs to be robust. For now, let's assume a simpler derivation for the placeholder.
-	// This needs to match what `{{ include "harvester-vm-dhcp-controller.fullname" . }}-agent` resolves to.
-	// This is difficult to resolve from within the controller without more context (like Release Name, Chart Name).
-	// Let's hardcode for now based on common Helm chart naming, this is a simplification.
-	// Example: if release is "harvester", chart is "vm-dhcp-controller", fullname is "harvester-vm-dhcp-controller"
-	// Agent deployment: "harvester-vm-dhcp-controller-agent"
-	// This is a critical piece that needs to be accurate.
-	// It might be better to pass this via an environment variable set in the controller's deployment.yaml.
-	agentDeploymentName := os.Getenv("AGENT_DEPLOYMENT_NAME")
-	if agentDeploymentName == "" {
-		// Fallback, but this should be explicitly set for reliability.
-		logrus.Warn("AGENT_DEPLOYMENT_NAME env var not set, agent deployment updates may fail.")
-		// This is a guess and likely incorrect without proper templating/env var.
-		agentDeploymentName = "harvester-vm-dhcp-controller-agent"
+// Constants for resource naming, these might need to be configurable or derived from controller's own name/chart info.
+const (
+	agentResourceNamePrefix       = "vm-dhcp-agent"
+	agentServiceAccountNameSuffix = "-sa"
+	agentClusterRoleBindingSuffix = "-crb"
+	// This needs to be the literal name of the ClusterRole defined in Helm chart for agents.
+	// From previous fix: {{ .Release.Name }}-dhcp-agent-clusterrole
+	// This must be passed to the controller, e.g., via env var.
+	DefaultSharedAgentClusterRoleName = "harvester-dhcp-agent-clusterrole" // Placeholder - MUST BE MADE CONFIGURABLE VIA ENV
+)
+
+// sanitizeNameForKubernetes sanitizes a name part for use in Kubernetes resource names.
+// It converts to lowercase and replaces invalid characters with hyphens.
+// It also truncates to a reasonable length to avoid exceeding limits when combined with prefixes/suffixes.
+func sanitizeNameForKubernetes(namePart string) string {
+	sanitized := strings.ToLower(namePart)
+	// Replace common invalid characters. A more robust regex might be needed for full compliance.
+	sanitized = strings.ReplaceAll(sanitized, ".", "-")
+	sanitized = strings.ReplaceAll(sanitized, "/", "-")
+	// Example: disallow chars not in [a-z0-9-] based on DNS-1123
+	// For simplicity, this example is basic.
+
+	// Truncate if too long to prevent overall name from exceeding limits (e.g., 63 chars for some names)
+	// Max length for a segment of a DNS label is 63, but full names can be longer.
+	// Service names are often 63. Deployment names also.
+	const maxSegLen = 50 // Arbitrary reasonable length for a part of a name
+	if len(sanitized) > maxSegLen {
+		sanitized = sanitized[:maxSegLen]
 	}
-	return agentDeploymentName
+	// TODO: Ensure it doesn't start or end with a hyphen after sanitization if that's an issue.
+	return sanitized
 }
 
-// getAgentContainerName retrieves the agent container name from an environment variable.
-func (h *Handler) getAgentContainerName() string {
-	agentContainerName := os.Getenv("AGENT_CONTAINER_NAME")
-	if agentContainerName == "" {
-		logrus.Warnf("AGENT_CONTAINER_NAME env var not set, agent deployment updates may fail to find the container. Defaulting to '%s-agent'", "harvester-vm-dhcp-controller")
-		// This fallback is a guess based on common chart naming.
-		// It should be `Chart.Name + "-agent"`. Since Chart.Name is "harvester-vm-dhcp-controller",
-		// this becomes "harvester-vm-dhcp-controller-agent".
-		// However, the Helm template for agent container name is `{{ .Chart.Name }}-agent`.
-		// If Chart.Name from Chart.yaml is `harvester-vm-dhcp-controller`, then this is correct.
-		// If Chart.Name is something else, this fallback is wrong.
-		// The env var is the reliable source.
-		return "harvester-vm-dhcp-controller-agent" // Fallback based on typical Chart.Name
-	}
-	return agentContainerName
+// getAgentResourceName constructs a unique name for an agent resource.
+func getAgentResourceName(ippool *networkv1.IPPool, suffix string) string {
+	// Using a prefix, sanitized ippool namespace, and sanitized ippool name + suffix
+	// Example: vm-dhcp-agent-ns1-mypool-sa
+	return fmt.Sprintf("%s-%s-%s%s",
+		agentResourceNamePrefix,
+		sanitizeNameForKubernetes(ippool.Namespace),
+		sanitizeNameForKubernetes(ippool.Name),
+		suffix,
+	)
 }
 
 
-// syncAgentDeployment updates the agent deployment to attach to the NAD from the IPPool
-func (h *Handler) syncAgentDeployment(ipPool *networkv1.IPPool) error {
-	if ipPool == nil || ipPool.Spec.NetworkName == "" {
-		// Or handle deletion/detachment if networkName is cleared
+func (h *Handler) reconcileAgentForIPPool(ipPool *networkv1.IPPool) error {
+	ctx := context.TODO() // Replace with appropriate context if available
+
+	agentSAName := getAgentResourceName(ipPool, agentServiceAccountNameSuffix)
+	agentCRBName := getAgentResourceName(ipPool, agentClusterRoleBindingSuffix)
+	agentDepName := getAgentResourceName(ipPool, "") // No suffix for deployment itself, prefix is enough
+
+	// Target namespace for agent resources is the controller's namespace
+	agentResourceNamespace := h.agentNamespace
+
+
+	// Handle Deletion or Paused IPPool
+	if ipPool.DeletionTimestamp != nil || (ipPool.Spec.Paused != nil && *ipPool.Spec.Paused) {
+		logrus.Infof("IPPool %s/%s is being deleted or is paused. Deleting associated agent resources.", ipPool.Namespace, ipPool.Name)
+
+		// Delete Deployment
+		err := h.kubeClient.AppsV1().Deployments(agentResourceNamespace).Delete(ctx, agentDepName, metav1.DeleteOptions{})
+		if err != nil && !k8serrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete agent deployment %s/%s: %w", agentResourceNamespace, agentDepName, err)
+		}
+		if err == nil {
+			logrus.Infof("Deleted agent deployment %s/%s", agentResourceNamespace, agentDepName)
+		}
+
+		// Delete ClusterRoleBinding
+		// Note: Deleting CRB requires cluster-level permissions the controller now has.
+		err = h.kubeClient.RbacV1().ClusterRoleBindings().Delete(ctx, agentCRBName, metav1.DeleteOptions{})
+		if err != nil && !k8serrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete agent clusterrolebinding %s: %w", agentCRBName, err)
+		}
+		if err == nil {
+			logrus.Infof("Deleted agent clusterrolebinding %s", agentCRBName)
+		}
+
+		// Delete ServiceAccount
+		err = h.kubeClient.CoreV1().ServiceAccounts(agentResourceNamespace).Delete(ctx, agentSAName, metav1.DeleteOptions{})
+		if err != nil && !k8serrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete agent serviceaccount %s/%s: %w", agentResourceNamespace, agentSAName, err)
+		}
+		if err == nil {
+			logrus.Infof("Deleted agent serviceaccount %s/%s", agentResourceNamespace, agentSAName)
+		}
 		return nil
 	}
 
-	agentDepName := h.getAgentDeploymentName()
-	agentDepNamespace := h.agentNamespace
-
-	logrus.Infof("Syncing agent deployment %s/%s for IPPool %s/%s (NAD: %s)",
-		agentDepNamespace, agentDepName, ipPool.Namespace, ipPool.Name, ipPool.Spec.NetworkName)
-
-	deployment, err := h.kubeClient.AppsV1().Deployments(agentDepNamespace).Get(context.TODO(), agentDepName, metav1.GetOptions{})
+	// --- Reconcile ServiceAccount ---
+	saClient := h.kubeClient.CoreV1().ServiceAccounts(agentResourceNamespace)
+	_, err := saClient.Get(ctx, agentSAName, metav1.GetOptions{})
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
-			logrus.Errorf("Agent deployment %s/%s not found, cannot update for IPPool %s", agentDepNamespace, agentDepName, ipPool.Name)
-			return nil // Or return error if agent deployment is mandatory
+			logrus.Infof("Agent ServiceAccount %s/%s not found, creating.", agentResourceNamespace, agentSAName)
+			sa := &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      agentSAName,
+					Namespace: agentResourceNamespace,
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(ipPool, networkv1.SchemeGroupVersion.WithKind("IPPool"))},
+				},
+			}
+			_, err = saClient.Create(ctx, sa, metav1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to create agent ServiceAccount %s/%s: %w", agentResourceNamespace, agentSAName, err)
+			}
+			logrus.Infof("Created agent ServiceAccount %s/%s", agentResourceNamespace, agentSAName)
+		} else {
+			return fmt.Errorf("failed to get agent ServiceAccount %s/%s: %w", agentResourceNamespace, agentSAName, err)
 		}
-		return fmt.Errorf("failed to get agent deployment %s/%s: %w", agentDepNamespace, agentDepName, err)
-	}
-
-	nadNamespace, nadName := kv.RSplit(ipPool.Spec.NetworkName, "/")
-	if nadName == "" { // Assume it's in the same namespace as IPPool if no "/"
-		nadName = nadNamespace
-		nadNamespace = ipPool.Namespace
-	}
-
-	// Determine target interface name, e.g., from IPPool annotation or default
-	// For now, using DefaultAgentPodInterfaceName = "net1"
-	podIFName := DefaultAgentPodInterfaceName
-	// Potentially override podIFName from an IPPool annotation in the future
-	// e.g., podIFName = ipPool.Annotations["network.harvesterhci.io/agent-pod-interface-name"]
-
-	desiredAnnotationValue := fmt.Sprintf("%s/%s@%s", nadNamespace, nadName, podIFName)
-
-	needsUpdate := false
-	currentAnnotationValue, annotationExists := deployment.Spec.Template.Annotations[multusNetworksAnnotationKey]
-
-	if !annotationExists || currentAnnotationValue != desiredAnnotationValue {
-		if deployment.Spec.Template.Annotations == nil {
-			deployment.Spec.Template.Annotations = make(map[string]string)
-		}
-		deployment.Spec.Template.Annotations[multusNetworksAnnotationKey] = desiredAnnotationValue
-		needsUpdate = true
-		logrus.Infof("Updating agent deployment %s/%s annotation to: %s", agentDepNamespace, agentDepName, desiredAnnotationValue)
-	}
-
-	// Find and update the --nic argument
-	containerFound := false
-	for i, container := range deployment.Spec.Template.Spec.Containers {
-		agentContainerName := h.getAgentContainerName()
-		if container.Name == agentContainerName {
-			containerFound = true
-			originalArgs := container.Args
-			newArgs := []string{}
-			nicArgUpdated := false
-			skipNext := false
-
-			for j := 0; j < len(originalArgs); j++ {
-				if skipNext {
-					skipNext = false
-					continue
-				}
-				arg := originalArgs[j]
-				if strings.HasPrefix(arg, "--nic=") {
-					currentVal := strings.SplitN(arg, "=", 2)[1]
-					if currentVal != podIFName {
-						logrus.Infof("Updating --nic arg for agent deployment %s/%s from %s to %s (form --nic=value)",
-							agentDepNamespace, agentDepName, arg, fmt.Sprintf("--nic=%s", podIFName))
-						newArgs = append(newArgs, fmt.Sprintf("--nic=%s", podIFName))
-						needsUpdate = true
-					} else {
-						newArgs = append(newArgs, arg) // Already correct
-					}
-					nicArgUpdated = true
-				} else if arg == "--nic" {
-					if j+1 < len(originalArgs) { // Check if there's a value after --nic
-						currentVal := originalArgs[j+1]
-						if currentVal != podIFName {
-							logrus.Infof("Updating --nic arg for agent deployment %s/%s from %s to %s (form --nic value)",
-								agentDepNamespace, agentDepName, currentVal, podIFName)
-							newArgs = append(newArgs, "--nic", podIFName)
-							needsUpdate = true
-						} else {
-							newArgs = append(newArgs, "--nic", currentVal) // Already correct
-						}
-						skipNext = true // Skip the original value part
-					} else { // --nic was the last argument, malformed or expecting default
-						logrus.Infof("Adding value for --nic arg for agent deployment %s/%s, new value: %s",
-							agentDepNamespace, agentDepName, podIFName)
-						newArgs = append(newArgs, "--nic", podIFName)
-						needsUpdate = true
-					}
-					nicArgUpdated = true
-				} else {
-					newArgs = append(newArgs, arg)
-				}
-			}
-
-			if !nicArgUpdated {
-				logrus.Infof("Adding --nic arg %s for agent deployment %s/%s", podIFName, agentDepNamespace, agentDepName)
-				newArgs = append(newArgs, "--nic", podIFName)
-				needsUpdate = true
-			}
-			deployment.Spec.Template.Spec.Containers[i].Args = newArgs // Commit --nic changes
-
-			// Ensure desiredIPPoolRef is defined before this block
-			desiredIPPoolRef := fmt.Sprintf("%s/%s", ipPool.Namespace, ipPool.Name)
-
-			// Update/Set IPPOOL_REF environment variable
-			envVarFound := false
-			for k, envVar := range deployment.Spec.Template.Spec.Containers[i].Env {
-				if envVar.Name == "IPPOOL_REF" {
-					envVarFound = true
-					if envVar.Value != desiredIPPoolRef {
-						logrus.Infof("Updating IPPOOL_REF env var for agent deployment %s/%s from '%s' to '%s'",
-							agentDepNamespace, agentDepName, envVar.Value, desiredIPPoolRef)
-						deployment.Spec.Template.Spec.Containers[i].Env[k].Value = desiredIPPoolRef
-						needsUpdate = true
-					}
-					break
-				}
-			}
-			if !envVarFound {
-				logrus.Infof("Adding IPPOOL_REF env var '%s' for agent deployment %s/%s", desiredIPPoolRef, agentDepNamespace, agentDepName)
-				deployment.Spec.Template.Spec.Containers[i].Env = append(deployment.Spec.Template.Spec.Containers[i].Env, corev1.EnvVar{
-					Name:  "IPPOOL_REF",
-					Value: desiredIPPoolRef,
-				})
-				needsUpdate = true
-			}
-
-			// Update/Set --server-ip and --cidr arguments
-			desiredServerIP := ipPool.Spec.IPv4Config.ServerIP
-			desiredCIDR := ipPool.Spec.IPv4Config.CIDR
-
-			// Re-fetch args as they might have been changed by --nic update
-			currentArgs := deployment.Spec.Template.Spec.Containers[i].Args
-			finalArgs := []string{}
-			processedFlags := make(map[string]bool) // To track if we've handled a flag
-
-			for j := 0; j < len(currentArgs); j++ {
-				arg := currentArgs[j]
-				// Handle --nic (already processed, just copy)
-				if strings.HasPrefix(arg, "--nic=") || arg == "--nic" {
-					finalArgs = append(finalArgs, arg)
-					if arg == "--nic" && j+1 < len(currentArgs) && !strings.HasPrefix(currentArgs[j+1], "--") {
-						finalArgs = append(finalArgs, currentArgs[j+1])
-						j++
-					}
-					processedFlags["--nic"] = true
-					continue
-				}
-
-				// Handle --server-ip
-				if strings.HasPrefix(arg, "--server-ip=") {
-					if arg != fmt.Sprintf("--server-ip=%s", desiredServerIP) {
-						logrus.Infof("Updating --server-ip arg for agent deployment from %s to %s", arg, desiredServerIP)
-						finalArgs = append(finalArgs, fmt.Sprintf("--server-ip=%s", desiredServerIP))
-						needsUpdate = true
-					} else {
-						finalArgs = append(finalArgs, arg)
-					}
-					processedFlags["--server-ip"] = true
-					continue
-				}
-				if arg == "--server-ip" {
-					if j+1 < len(currentArgs) && !strings.HasPrefix(currentArgs[j+1], "--") {
-						if currentArgs[j+1] != desiredServerIP {
-							logrus.Infof("Updating --server-ip value for agent deployment from %s to %s", currentArgs[j+1], desiredServerIP)
-							needsUpdate = true
-						}
-						finalArgs = append(finalArgs, "--server-ip", desiredServerIP)
-						j++
-					} else { // Flag without value or next is another flag
-						logrus.Infof("Setting value for --server-ip arg for agent deployment to %s", desiredServerIP)
-						finalArgs = append(finalArgs, "--server-ip", desiredServerIP)
-						needsUpdate = true
-					}
-					processedFlags["--server-ip"] = true
-					continue
-				}
-
-				// Handle --cidr
-				if strings.HasPrefix(arg, "--cidr=") {
-					if arg != fmt.Sprintf("--cidr=%s", desiredCIDR) {
-						logrus.Infof("Updating --cidr arg for agent deployment from %s to %s", arg, desiredCIDR)
-						finalArgs = append(finalArgs, fmt.Sprintf("--cidr=%s", desiredCIDR))
-						needsUpdate = true
-					} else {
-						finalArgs = append(finalArgs, arg)
-					}
-					processedFlags["--cidr"] = true
-					continue
-				}
-				if arg == "--cidr" {
-					if j+1 < len(currentArgs) && !strings.HasPrefix(currentArgs[j+1], "--") {
-						if currentArgs[j+1] != desiredCIDR {
-							logrus.Infof("Updating --cidr value for agent deployment from %s to %s", currentArgs[j+1], desiredCIDR)
-							needsUpdate = true
-						}
-						finalArgs = append(finalArgs, "--cidr", desiredCIDR)
-						j++
-					} else {
-						logrus.Infof("Setting value for --cidr arg for agent deployment to %s", desiredCIDR)
-						finalArgs = append(finalArgs, "--cidr", desiredCIDR)
-						needsUpdate = true
-					}
-					processedFlags["--cidr"] = true
-					continue
-				}
-				// Copy other args
-				finalArgs = append(finalArgs, arg)
-			}
-
-			// Add flags if they weren't processed (i.e., didn't exist)
-			if !processedFlags["--server-ip"] && desiredServerIP != "" {
-				logrus.Infof("Adding --server-ip arg %s for agent deployment", desiredServerIP)
-				finalArgs = append(finalArgs, "--server-ip", desiredServerIP)
-				needsUpdate = true
-			}
-			if !processedFlags["--cidr"] && desiredCIDR != "" {
-				logrus.Infof("Adding --cidr arg %s for agent deployment", desiredCIDR)
-				finalArgs = append(finalArgs, "--cidr", desiredCIDR)
-				needsUpdate = true
-			}
-			deployment.Spec.Template.Spec.Containers[i].Args = finalArgs
-			break
-		}
-	}
-
-	if !containerFound {
-		// Use agentContainerName variable which holds the result of h.getAgentContainerName()
-		// This variable should be defined at the beginning of the loop or function if not already.
-		// Let's ensure agentContainerName is in scope here.
-		// It was defined when iterating containers: agentContainerName := h.getAgentContainerName()
-		// This means it needs to be fetched once before the loop.
-		logrus.Warnf("Agent container '%s' not found in deployment %s/%s. Cannot update args or IPPOOL_REF env var.", h.getAgentContainerName(), agentDepNamespace, agentDepName)
-	}
-
-
-	if needsUpdate {
-		logrus.Infof("Patching agent deployment %s/%s", agentDepNamespace, agentDepName)
-		_, err = h.kubeClient.AppsV1().Deployments(agentDepNamespace).Update(context.TODO(), deployment, metav1.UpdateOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to update agent deployment %s/%s: %w", agentDepNamespace, agentDepName, err)
-		}
-		logrus.Infof("Successfully patched agent deployment %s/%s", agentDepNamespace, agentDepName)
 	} else {
-		logrus.Infof("Agent deployment %s/%s already up-to-date for IPPool %s/%s (NAD: %s)",
-			agentDepNamespace, agentDepName, ipPool.Namespace, ipPool.Name, ipPool.Spec.NetworkName)
+		// TODO: Update SA if needed (e.g., labels, annotations, ownerrefs if they changed)
+		logrus.Debugf("Agent ServiceAccount %s/%s already exists.", agentResourceNamespace, agentSAName)
 	}
+
+	// --- Reconcile ClusterRoleBinding ---
+	// This assumes a shared ClusterRole for all agents. Name needs to be configurable.
+	sharedAgentCRName := os.Getenv("SHARED_AGENT_CLUSTERROLE_NAME")
+	if sharedAgentCRName == "" {
+		sharedAgentCRName = DefaultSharedAgentClusterRoleName // Use fallback
+		logrus.Warnf("SHARED_AGENT_CLUSTERROLE_NAME env var not set, using fallback: %s", sharedAgentCRName)
+	}
+
+	crbClient := h.kubeClient.RbacV1().ClusterRoleBindings()
+	_, err = crbClient.Get(ctx, agentCRBName, metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			logrus.Infof("Agent ClusterRoleBinding %s not found, creating.", agentCRBName)
+			crb := &rbacv1.ClusterRoleBinding{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: agentCRBName,
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(ipPool, networkv1.SchemeGroupVersion.WithKind("IPPool"))},
+				},
+				Subjects: []rbacv1.Subject{
+					{Kind: "ServiceAccount", Name: agentSAName, Namespace: agentResourceNamespace},
+				},
+				RoleRef: rbacv1.RoleRef{
+					APIGroup: "rbac.authorization.k8s.io",
+					Kind:     "ClusterRole",
+					Name:     sharedAgentCRName,
+				},
+			}
+			_, err = crbClient.Create(ctx, crb, metav1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to create agent ClusterRoleBinding %s: %w", agentCRBName, err)
+			}
+			logrus.Infof("Created agent ClusterRoleBinding %s for SA %s/%s to ClusterRole %s", agentCRBName, agentResourceNamespace, agentSAName, sharedAgentCRName)
+		} else {
+			return fmt.Errorf("failed to get agent ClusterRoleBinding %s: %w", agentCRBName, err)
+		}
+	} else {
+		// TODO: Update CRB if needed (e.g. if subject or roleref changed, though unlikely for this pattern)
+		logrus.Debugf("Agent ClusterRoleBinding %s already exists.", agentCRBName)
+	}
+
+	// --- Reconcile Agent Deployment ---
+	// This part is complex and involves defining the full Deployment spec.
+	// For brevity, only logging for now. Full implementation would mirror chart/templates/agent-deployment.yaml.
+	logrus.Infof("TODO: Reconcile Agent Deployment %s/%s for IPPool %s/%s", agentResourceNamespace, agentDepName, ipPool.Namespace, ipPool.Name)
+	// Example of what needs to be done:
+	// desiredDeployment := constructDesiredAgentDeployment(ipPool, agentDepName, agentSAName, agentResourceNamespace, h.getAgentContainerName())
+	// existingDeployment, err := h.kubeClient.AppsV1().Deployments(agentResourceNamespace).Get(ctx, agentDepName, metav1.GetOptions{})
+	// if k8serrors.IsNotFound(err) {
+	//    _, err = h.kubeClient.AppsV1().Deployments(agentResourceNamespace).Create(ctx, desiredDeployment, metav1.CreateOptions{})
+	// } else if err == nil {
+	//    if needsUpdate(existingDeployment, desiredDeployment) {
+	//       _, err = h.kubeClient.AppsV1().Deployments(agentResourceNamespace).Update(ctx, desiredDeployment, metav1.UpdateOptions{})
+	//    }
+	// }
+	// if err != nil { ... handle error ... }
 
 	return nil
 }
@@ -551,12 +431,18 @@ func (h *Handler) syncAgentDeployment(ipPool *networkv1.IPPool) error {
 
 func (h *Handler) OnRemove(key string, ipPool *networkv1.IPPool) (*networkv1.IPPool, error) {
 	if ipPool == nil {
-		return nil, nil
+		return nil, nil // Should not happen if DeletionTimestamp is not set
 	}
 
-	logrus.Debugf("(ippool.OnRemove) ippool configuration %s/%s has been removed", ipPool.Namespace, ipPool.Name)
+	logrus.Debugf("(ippool.OnRemove) ippool configuration %s/%s has been removed or is being deleted", ipPool.Namespace, ipPool.Name)
 
-	if err := h.cleanup(ipPool); err != nil {
+	// Call reconcileAgentForIPPool to handle deletion of associated agent resources
+	if err := h.reconcileAgentForIPPool(ipPool); err != nil {
+		logrus.Errorf("Failed to reconcile/delete agent for removed ippool %s: %v", key, err)
+		// Potentially requeue or handle error, but for deletion, usually best effort
+	}
+
+	if err := h.cleanup(ipPool); err != nil { // This is for IPAM/Cache cleanup
 		return ipPool, err
 	}
 

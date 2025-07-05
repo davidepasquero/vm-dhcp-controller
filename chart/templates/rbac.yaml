@@ -25,14 +25,28 @@ rules:
   resources: [ "virtualmachines" ]
   verbs: [ "get", "watch", "list" ]
 ---
+# This is the new shared ClusterRole for all dynamically created DHCP agents
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "harvester-vm-dhcp-controller.name" . }}-agent
+  # Name needs to be consistent and known by the main controller (e.g., via env var)
+  # Let's use a name based on Release.Name for now.
+  # This was previously {{ .Release.Name }}-dhcp-agent-clusterrole
+  # Let's rename to {{ .Release.Name }}-vm-dhcp-agent-shared-permissions
+  name: {{ .Release.Name }}-vm-dhcp-agent-shared-permissions
 rules:
-- apiGroups: [ "network.harvesterhci.io" ]
-  resources: [ "ippools", "ippools/status" ]
-  verbs: [ "get", "watch", "list" ]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"] # For leader election
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["configmaps"] # For leader election if not using leases
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+- apiGroups: ["network.harvesterhci.io"]
+  resources: ["ippools"] # To get its IPPool config (the one specified in IPPOOL_REF)
+  verbs: ["get", "watch", "list"] # Needs get for specific IPPool, list/watch for its cache
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -79,21 +93,22 @@ subjects:
   name: {{ include "harvester-vm-dhcp-controller.serviceAccountName" . }}
   namespace: {{ .Release.Namespace }}
 ---
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: {{ include "harvester-vm-dhcp-controller.name" . }}-agent
-  labels:
-  {{- include "harvester-vm-dhcp-controller.labels" . | nindent 4 }}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: {{ include "harvester-vm-dhcp-controller.name" . }}-agent
-subjects:
-- kind: ServiceAccount
-  name: {{ include "harvester-vm-dhcp-controller.serviceAccountName" . }}-agent
-  namespace: {{ .Release.Namespace }}
----
+# Removed static agent ClusterRoleBinding
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: ClusterRoleBinding
+# metadata:
+#   name: {{ include "harvester-vm-dhcp-controller.name" . }}-agent
+#   labels:
+#   {{- include "harvester-vm-dhcp-controller.labels" . | nindent 4 }}
+# roleRef:
+#   apiGroup: rbac.authorization.k8s.io
+#   kind: ClusterRole
+#   name: {{ include "harvester-vm-dhcp-controller.name" . }}-agent # This role was also removed and replaced by the shared one
+# subjects:
+# - kind: ServiceAccount
+#   name: {{ include "harvester-vm-dhcp-controller.serviceAccountName" . }}-agent # Static agent SA, no longer created by default
+#   namespace: {{ .Release.Namespace }}
+# ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -117,7 +132,32 @@ metadata:
 rules:
 - apiGroups: ["apps"]
   resources: ["deployments"]
-  verbs: ["get", "list", "watch", "patch", "update"]
+  verbs: ["get", "list", "watch", "patch", "update", "create", "delete"]
+- apiGroups: [""] # Core API group
+  resources: ["serviceaccounts"]
+  verbs: ["create", "get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole # New ClusterRole to manage ClusterRoleBindings
+metadata:
+  name: {{ include "harvester-vm-dhcp-controller.name" . }}-crb-manager
+rules:
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterrolebindings"]
+  verbs: ["create", "get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding # Bind the new ClusterRole to the controller's SA
+metadata:
+  name: {{ include "harvester-vm-dhcp-controller.name" . }}-manage-crbs
+subjects:
+- kind: ServiceAccount
+  name: {{ include "harvester-vm-dhcp-controller.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "harvester-vm-dhcp-controller.name" . }}-crb-manager
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

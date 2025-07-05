@@ -10,27 +10,23 @@ image:
   # Overrides the image tag whose default is the chart appVersion.
   tag: "main-head"
 
-# Agent configuration
+# Agent configuration (defaults for dynamically created agents)
 agent:
-  enabled: true # Controls whether agent deployment and related resources are created
-  replicaCount: 2
+  replicaCount: 1 # Each dynamic agent deployment will likely have 1 replica
   image:
     repository: rancher/harvester-vm-dhcp-agent # Specific agent image
     pullPolicy: IfNotPresent
     tag: "main-head" # Or specific version for agent
   # Flag to disable leader election within the agent pods
+  # Note: Each dynamic agent instance will perform its own leader election if not disabled.
+  # Consider if leader election is needed per-agent-instance or if a different HA model is desired.
+  # For now, keeping this, assuming each agent instance (per IPPool) might need it if it were replicated.
   noLeaderElection: false
+  # serviceAccount.create, .name and rbac.create are no longer used for a single static agent.
+  # The controller creates SAs and CRBs for each dynamic agent.
+  # Annotations for dynamically created SAs could be added here if needed.
   serviceAccount:
-    # Specifies whether a service account should be created for the agent
-    create: true
-    # Annotations to add to the agent service account
     annotations: {}
-    # The name of the service account to use for the agent.
-    # If not set and create is true, a name is generated using the fullname template + "-agent"
-    name: ""
-  rbac:
-    # Specifies whether RBAC resources (ClusterRole, ClusterRoleBinding) should be created for the agent
-    create: true
   # Pod security context for agent pods
   podSecurityContext: {}
   # Security context for agent containers
