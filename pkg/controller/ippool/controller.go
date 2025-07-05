@@ -34,9 +34,8 @@ const (
 	multusNetworksAnnotationKey         = "k8s.v1.cni.cncf.io/networks"
 	holdIPPoolAgentUpgradeAnnotationKey = "network.harvesterhci.io/hold-ippool-agent-upgrade"
 
-	vmDHCPControllerLabelKey       = network.GroupName + "/vm-dhcp-controller"
-	clusterNetworkLabelKey         = network.GroupName + "/clusternetwork"
-	agentReplicas            int32 = 2
+	vmDHCPControllerLabelKey = network.GroupName + "/vm-dhcp-controller"
+	clusterNetworkLabelKey   = network.GroupName + "/clusternetwork"
 
 	setIPAddrScript = `
 #!/usr/bin/env sh
