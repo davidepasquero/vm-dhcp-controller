@@ -1,6 +1,6 @@
 # Refactoring for Scalability and Stability
 
-**Authors:** Networking Team  
+**Authors:** davidepasquero
 **Status:** Draft  
 **Created At:** 2025-09-15  
 **Last Updated:** 2025-09-15
