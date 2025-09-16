@@ -1,4 +1,4 @@
-# HEP-001: Refactoring for Scalability and Stability
+# Refactoring for Scalability and Stability
 
 **Authors:** Networking Team  
 **Status:** Draft  
