@@ -71,15 +71,11 @@ Operating one DHCP agent per IPPool required repetitive manifests, manual Multus
 
 ### Diagrams
 
-```
-IPPool CRDs ──▶ Controller reconciliation ──▶ Agent deployment patch
-                                         │                   │
-                                         ▼                   ▼
-                                 Cache/IPAM updates   Agent JSON config
-                                                         │
-                                                         ▼
-                                        Per-pool handlers & DHCP servers
-```
+- **IPPool CRDs** capture IPv4 ranges, lifecycle conditions, and optional pause semantics that seed the reconcile loop.【F:pkg/apis/network.harvesterhci.io/v1alpha1/ippool.go†L9-L130】
+- **Controller reconcile loop** aggregates active pools, labels the referenced NADs, builds the `AGENT_NETWORK_CONFIGS`/`IPPOOL_REFS_JSON` payloads, and patches the shared agent Deployment template exposed by the Helm chart.【F:pkg/controller/ippool/controller.go†L143-L452】【F:chart/templates/deployment.yaml†L35-L58】
+- **Helm chart templates** supply the unified agent Deployment, service account, and configurable values that both the controller and runtime consume when rendering pods.【F:chart/templates/agent-deployment.yaml†L1-L59】【F:chart/values.yaml†L13-L43】
+- **Agent Deployment and runtime** deserialize the JSON configuration, configure Multus-backed interfaces, and launch per-pool watchers before exposing DHCP services keyed by IPPool reference.【F:pkg/agent/agent.go†L63-L317】【F:pkg/agent/ippool/controller.go†L19-L173】【F:pkg/dhcp/dhcp.go†L57-L409】
+- **Leader election** in both binaries ensures that only one controller or agent instance actively reconciles resources at a time, preventing conflicting updates.【F:cmd/agent/run.go†L22-L103】【F:cmd/controller/run.go†L26-L110】
 
 ---
 
