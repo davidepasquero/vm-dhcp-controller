@@ -125,8 +125,8 @@ The current per-pool management spawns many pods, duplicates the same image, and
 
 ## References
 
-- Updated controller/agent/DHCP implementations across the latest repository commits.
-- Helm chart updates orchestrating the new operating model.
+- Pull Request : https://github.com/harvester/vm-dhcp-controller/pull/64
+- Issue : https://github.com/harvester/harvester/issues/8794
 
 ---
 
