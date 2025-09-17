@@ -1,4 +1,4 @@
-# HEP-001: Unified Multi-IPPool DHCP Agent
+# HEP-001: Refactoring for Scalability and Stability
 
 **Authors:** davidepasquero
 **Status:** Draft  
