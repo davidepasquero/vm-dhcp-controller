@@ -45,7 +45,7 @@ L'attuale gestione per-pool genera molti pod, repliche ripetitive della stessa i
 
 ### Flusso dati/controllo
 
-1. L'IPPool controller etichetta la NAD, aggiorna stato/metrica IPAM e prepara la lista di pool attivi ordinata.【F:pkg/controller/ippool/controller.go†L151-L341】  
+1. L'IPPool controller aggiunge alla NAD le label `network.harvesterhci.io/ippool-namespace` e `network.harvesterhci.io/ippool-name` per marcare l'associazione con il pool, quindi aggiorna stato/metrica IPAM e prepara la lista di IPPool attivi ordinata.【F:pkg/controller/ippool/controller.go†L151-L341】【F:pkg/controller/ippool/controller.go†L596-L620】
 2. Il controller serializza `AgentNetConfig` e `IPPoolRefs` in JSON ed aggiorna l'annotation Multus del Deployment agente.【F:pkg/controller/ippool/controller.go†L321-L418】  
 3. Il pod agente riceve gli env via Downward API, configura le interfacce (flush, ip addr add, up) e crea un handler per ciascun IPPool osservato.【F:pkg/agent/agent.go†L37-L206】  
 4. Ogni handler attende il sync dell'informer e popola l'allocatore DHCP con le lease correnti, segnalando `InitialSyncDone`.【F:pkg/agent/ippool/controller.go†L19-L199】  
