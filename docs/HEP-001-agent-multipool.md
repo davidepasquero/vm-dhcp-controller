@@ -9,7 +9,7 @@
 
 ## Summary
 
-We propose replacing the "one agent pod per IPPool" model with a single DHCP agent Deployment capable of serving multiple networks in parallel. The controller dynamically assembles the configuration (Multus annotation and JSON environment variables) for every active IPPool, and the agent starts watchers and DHCP servers for each pool using a multi-tenant allocator.
+This set of changes introduces a fundamental architectural evolution for the vm-dhcp-controller, transforming it into a more robust, scalable, and resilient solution. The main update shifts the agent management model from one pod per IPPool to a unified Deployment, while also introducing a leader election mechanism to ensure high availability. We propose replacing the "one agent pod per IPPool" model with a single DHCP agent Deployment capable of serving multiple networks in parallel. The controller dynamically assembles the configuration (Multus annotation and JSON environment variables) for every active IPPool, and the agent starts watchers and DHCP servers for each pool using a multi-tenant allocator.
 
 ---
 
