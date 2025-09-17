@@ -1,6 +1,6 @@
 # HEP-001: Unified Multi-IPPool DHCP Agent
 
-**Authors:** vm-dhcp-controller maintainers  
+**Authors:** davidepasquero
 **Status:** Draft  
 **Created At:** 2024-03-08  
 **Last Updated:** 2024-03-08  
