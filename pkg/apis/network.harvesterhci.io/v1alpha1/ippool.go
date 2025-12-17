@@ -123,6 +123,10 @@ type IPPoolStatus struct {
 
 	// +optional
 	// +kubebuilder:validation:Optional
+	AgentDeploymentRef *DeploymentReference `json:"agentDeploymentRef,omitempty"`
+
+	// +optional
+	// +kubebuilder:validation:Optional
 	Conditions []genericcondition.GenericCondition `json:"conditions,omitempty"`
 }
 
@@ -133,6 +137,13 @@ type IPv4Status struct {
 }
 
 type PodReference struct {
+	Namespace string    `json:"namespace,omitempty"`
+	Name      string    `json:"name,omitempty"`
+	Image     string    `json:"image,omitempty"`
+	UID       types.UID `json:"uid,omitempty"`
+}
+
+type DeploymentReference struct {
 	Namespace string    `json:"namespace,omitempty"`
 	Name      string    `json:"name,omitempty"`
 	Image     string    `json:"image,omitempty"`

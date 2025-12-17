@@ -14,6 +14,8 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 
+	"k8s.io/client-go/kubernetes"
+
 	"github.com/harvester/vm-dhcp-controller/pkg/apis/network.harvesterhci.io"
 	networkv1 "github.com/harvester/vm-dhcp-controller/pkg/apis/network.harvesterhci.io/v1alpha1"
 	"github.com/harvester/vm-dhcp-controller/pkg/cache"
@@ -69,10 +71,12 @@ type Handler struct {
 	ippoolController ctlnetworkv1.IPPoolController
 	ippoolClient     ctlnetworkv1.IPPoolClient
 	ippoolCache      ctlnetworkv1.IPPoolCache
-	podClient        ctlcorev1.PodClient
-	podCache         ctlcorev1.PodCache
-	nadClient        ctlcniv1.NetworkAttachmentDefinitionClient
-	nadCache         ctlcniv1.NetworkAttachmentDefinitionCache
+
+	k8sClient kubernetes.Interface
+	podCache  ctlcorev1.PodCache
+
+	nadClient ctlcniv1.NetworkAttachmentDefinitionClient
+	nadCache  ctlcniv1.NetworkAttachmentDefinitionCache
 }
 
 func Register(ctx context.Context, management *config.Management) error {
@@ -94,10 +98,12 @@ func Register(ctx context.Context, management *config.Management) error {
 		ippoolController: ippools,
 		ippoolClient:     ippools,
 		ippoolCache:      ippools.Cache(),
-		podClient:        pods,
-		podCache:         pods.Cache(),
-		nadClient:        nads,
-		nadCache:         nads.Cache(),
+
+		k8sClient: management.ClientSet,
+		podCache:  pods.Cache(),
+
+		nadClient: nads,
+		nadCache:  nads.Cache(),
 	}
 
 	ctlnetworkv1.RegisterIPPoolStatusHandler(
@@ -168,6 +174,7 @@ func (h *Handler) OnChange(key string, ipPool *networkv1.IPPool) (*networkv1.IPP
 			return ipPool, err
 		}
 		ipPoolCpy.Status.AgentPodRef = nil
+		ipPoolCpy.Status.AgentDeploymentRef = nil
 		networkv1.Stopped.True(ipPoolCpy)
 		if !reflect.DeepEqual(ipPoolCpy, ipPool) {
 			return h.ippoolClient.UpdateStatus(ipPoolCpy)
@@ -266,8 +273,8 @@ func (h *Handler) OnRemove(key string, ipPool *networkv1.IPPool) (*networkv1.IPP
 	return ipPool, nil
 }
 
-// DeployAgent reconciles ipPool and ensures there's an agent pod for it. The
-// returned status reports whether an agent pod is registered.
+// DeployAgent reconciles ipPool and ensures there's an agent deployment for it. The
+// returned status reports whether an agent is registered.
 func (h *Handler) DeployAgent(ipPool *networkv1.IPPool, status networkv1.IPPoolStatus) (networkv1.IPPoolStatus, error) {
 	logrus.Debugf("(ippool.DeployAgent) deploy agent for ippool %s/%s", ipPool.Namespace, ipPool.Name)
 
@@ -277,6 +284,10 @@ func (h *Handler) DeployAgent(ipPool *networkv1.IPPool, status networkv1.IPPoolS
 
 	if h.noAgent {
 		return status, nil
+	}
+
+	if h.k8sClient == nil {
+		return status, fmt.Errorf("k8s client not initialized")
 	}
 
 	nadNamespace, nadName := kv.RSplit(ipPool.Spec.NetworkName, "/")
@@ -294,52 +305,86 @@ func (h *Handler) DeployAgent(ipPool *networkv1.IPPool, status networkv1.IPPoolS
 		return status, fmt.Errorf("could not find clusternetwork for nad %s", ipPool.Spec.NetworkName)
 	}
 
+	desiredImage := h.getAgentImage(ipPool)
+
+	// Best-effort cleanup of legacy agent pod (pre-deployment versions).
 	if ipPool.Status.AgentPodRef != nil {
-		status.AgentPodRef.Image = h.getAgentImage(ipPool)
-		pod, err := h.podCache.Get(ipPool.Status.AgentPodRef.Namespace, ipPool.Status.AgentPodRef.Name)
+		legacy := ipPool.Status.AgentPodRef
+		if err := h.k8sClient.CoreV1().Pods(legacy.Namespace).Delete(context.Background(), legacy.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return status, err
+		}
+		status.AgentPodRef = nil
+	}
+
+	agentDeployment, err := prepareAgentDeployment(ipPool, h.noDHCP, h.agentNamespace, clusterNetwork, h.agentServiceAccountName, desiredImage)
+	if err != nil {
+		return status, err
+	}
+	config.Scheme.Default(agentDeployment)
+
+	deployments := h.k8sClient.AppsV1().Deployments(agentDeployment.Namespace)
+	existing, err := deployments.Get(context.Background(), agentDeployment.Name, metav1.GetOptions{})
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			return status, err
+		}
+
+		logrus.Infof("(ippool.DeployAgent) agent deployment for ippool %s/%s missing, creating", ipPool.Namespace, ipPool.Name)
+		existing, err = deployments.Create(context.Background(), agentDeployment, metav1.CreateOptions{})
 		if err != nil {
-			if !apierrors.IsNotFound(err) {
+			if !apierrors.IsAlreadyExists(err) {
 				return status, err
 			}
-
-			logrus.Warningf("(ippool.DeployAgent) agent pod %s missing, redeploying", ipPool.Status.AgentPodRef.Name)
-		} else {
-			if pod.DeletionTimestamp != nil {
-				return status, fmt.Errorf("agent pod %s marked for deletion", ipPool.Status.AgentPodRef.Name)
+			existing, err = deployments.Get(context.Background(), agentDeployment.Name, metav1.GetOptions{})
+			if err != nil {
+				return status, err
 			}
-
-			if pod.GetUID() != ipPool.Status.AgentPodRef.UID {
-				return status, fmt.Errorf("agent pod %s uid mismatch", ipPool.Status.AgentPodRef.Name)
-			}
-
-			return status, nil
 		}
 	}
 
-	agent, err := prepareAgentPod(ipPool, h.noDHCP, h.agentNamespace, clusterNetwork, h.agentServiceAccountName, h.agentImage)
-	if err != nil {
-		return status, err
+	if existing.DeletionTimestamp != nil {
+		return status, fmt.Errorf("agent deployment %s marked for deletion", existing.Name)
 	}
 
-	if status.AgentPodRef == nil {
-		status.AgentPodRef = new(networkv1.PodReference)
+	if existing.Labels == nil ||
+		existing.Labels[vmDHCPControllerLabelKey] != "agent" ||
+		existing.Labels[util.IPPoolNamespaceLabelKey] != ipPool.Namespace ||
+		existing.Labels[util.IPPoolNameLabelKey] != ipPool.Name {
+		return status, fmt.Errorf("agent deployment %s label mismatch", existing.Name)
 	}
 
-	status.AgentPodRef.Image = h.agentImage.String()
+	if existing.Spec.Selector == nil || !reflect.DeepEqual(existing.Spec.Selector, agentDeployment.Spec.Selector) {
+		return status, fmt.Errorf("agent deployment %s selector mismatch", existing.Name)
+	}
 
-	agentPod, err := h.podClient.Create(agent)
-	if err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			return status, nil
+	updated := existing.DeepCopy()
+	if updated.Labels == nil {
+		updated.Labels = map[string]string{}
+	}
+	for k, v := range agentDeployment.Labels {
+		updated.Labels[k] = v
+	}
+	updated.Spec.Selector = existing.Spec.Selector
+	updated.Spec.Replicas = agentDeployment.Spec.Replicas
+	updated.Spec.Strategy = agentDeployment.Spec.Strategy
+	updated.Spec.Template = agentDeployment.Spec.Template
+	config.Scheme.Default(updated)
+
+	if !reflect.DeepEqual(existing.Spec, updated.Spec) || !reflect.DeepEqual(existing.Labels, updated.Labels) {
+		existing, err = deployments.Update(context.Background(), updated, metav1.UpdateOptions{})
+		if err != nil {
+			return status, err
 		}
-		return status, err
 	}
 
-	logrus.Infof("(ippool.DeployAgent) agent for ippool %s/%s has been deployed", ipPool.Namespace, ipPool.Name)
+	if status.AgentDeploymentRef == nil {
+		status.AgentDeploymentRef = new(networkv1.DeploymentReference)
+	}
 
-	status.AgentPodRef.Namespace = agentPod.Namespace
-	status.AgentPodRef.Name = agentPod.Name
-	status.AgentPodRef.UID = agentPod.GetUID()
+	status.AgentDeploymentRef.Namespace = existing.Namespace
+	status.AgentDeploymentRef.Name = existing.Name
+	status.AgentDeploymentRef.Image = desiredImage
+	status.AgentDeploymentRef.UID = existing.UID
 
 	return status, nil
 }
@@ -416,10 +461,8 @@ func (h *Handler) BuildCache(ipPool *networkv1.IPPool, status networkv1.IPPoolSt
 	return status, nil
 }
 
-// MonitorAgent reconciles ipPool and keeps an eye on the agent pod. If the
-// running agent pod does not match to the one record in ipPool's status,
-// MonitorAgent tries to delete it. The returned status reports whether the
-// agent pod is ready.
+// MonitorAgent reconciles ipPool and keeps an eye on the agent deployment. The
+// returned status reports whether an agent is ready.
 func (h *Handler) MonitorAgent(ipPool *networkv1.IPPool, status networkv1.IPPoolStatus) (networkv1.IPPoolStatus, error) {
 	logrus.Debugf("(ippool.MonitorAgent) monitor agent for ippool %s/%s", ipPool.Namespace, ipPool.Name)
 
@@ -431,29 +474,63 @@ func (h *Handler) MonitorAgent(ipPool *networkv1.IPPool, status networkv1.IPPool
 		return status, nil
 	}
 
-	if ipPool.Status.AgentPodRef == nil {
+	if ipPool.Status.AgentDeploymentRef == nil {
 		return status, fmt.Errorf("agent for ippool %s/%s is not deployed", ipPool.Namespace, ipPool.Name)
 	}
 
-	agentPod, err := h.podCache.Get(ipPool.Status.AgentPodRef.Namespace, ipPool.Status.AgentPodRef.Name)
+	if h.k8sClient == nil {
+		return status, fmt.Errorf("k8s client not initialized")
+	}
+
+	depRef := ipPool.Status.AgentDeploymentRef
+	deployment, err := h.k8sClient.AppsV1().Deployments(depRef.Namespace).Get(context.Background(), depRef.Name, metav1.GetOptions{})
 	if err != nil {
 		return status, err
 	}
 
-	if agentPod.GetUID() != ipPool.Status.AgentPodRef.UID || agentPod.Spec.Containers[0].Image != ipPool.Status.AgentPodRef.Image {
-		if agentPod.DeletionTimestamp != nil {
-			return status, fmt.Errorf("agent pod %s marked for deletion", agentPod.Name)
-		}
-
-		if err := h.podClient.Delete(agentPod.Namespace, agentPod.Name, &metav1.DeleteOptions{}); err != nil {
-			return status, err
-		}
-
-		return status, fmt.Errorf("agent pod %s obsolete and purged", agentPod.Name)
+	if deployment.DeletionTimestamp != nil {
+		return status, fmt.Errorf("agent deployment %s marked for deletion", deployment.Name)
 	}
 
-	if !isPodReady(agentPod) {
-		return status, fmt.Errorf("agent pod %s not ready", agentPod.Name)
+	if len(deployment.Spec.Template.Spec.Containers) == 0 {
+		return status, fmt.Errorf("agent deployment %s has no containers", deployment.Name)
+	}
+
+	if depRef.Image != "" && deployment.Spec.Template.Spec.Containers[0].Image != depRef.Image {
+		return status, fmt.Errorf("agent deployment %s template image mismatch", deployment.Name)
+	}
+
+	podSets := labels.Set{
+		vmDHCPControllerLabelKey:     "agent",
+		util.IPPoolNamespaceLabelKey: ipPool.Namespace,
+		util.IPPoolNameLabelKey:      ipPool.Name,
+	}
+	pods, err := h.podCache.List(depRef.Namespace, podSets.AsSelector())
+	if err != nil {
+		return status, err
+	}
+
+	var readyPods int
+	for _, pod := range pods {
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		if len(pod.Spec.Containers) == 0 {
+			continue
+		}
+		if depRef.Image != "" && pod.Spec.Containers[0].Image != depRef.Image {
+			continue
+		}
+		if isPodReady(pod) {
+			readyPods++
+		}
+	}
+
+	if readyPods == 0 {
+		return status, fmt.Errorf("agent deployment %s not ready", deployment.Name)
+	}
+	if readyPods > 1 {
+		return status, fmt.Errorf("agent deployment %s has multiple ready pods", deployment.Name)
 	}
 
 	return status, nil
@@ -469,30 +546,48 @@ func isPodReady(pod *corev1.Pod) bool {
 }
 
 func (h *Handler) getAgentImage(ipPool *networkv1.IPPool) string {
-	_, ok := ipPool.Annotations[holdIPPoolAgentUpgradeAnnotationKey]
-	if ok {
-		return ipPool.Status.AgentPodRef.Image
+	if _, ok := ipPool.Annotations[holdIPPoolAgentUpgradeAnnotationKey]; ok {
+		if ipPool.Status.AgentDeploymentRef != nil && ipPool.Status.AgentDeploymentRef.Image != "" {
+			return ipPool.Status.AgentDeploymentRef.Image
+		}
+		if ipPool.Status.AgentPodRef != nil && ipPool.Status.AgentPodRef.Image != "" {
+			return ipPool.Status.AgentPodRef.Image
+		}
 	}
 	return h.agentImage.String()
 }
 
 func (h *Handler) cleanup(ipPool *networkv1.IPPool) error {
-	if ipPool.Status.AgentPodRef == nil {
-		return nil
+	if h.k8sClient != nil {
+		if ipPool.Status.AgentDeploymentRef != nil {
+			ref := ipPool.Status.AgentDeploymentRef
+			logrus.Infof("(ippool.cleanup) remove the backing agent deployment %s/%s for ippool %s/%s", ref.Namespace, ref.Name, ipPool.Namespace, ipPool.Name)
+			if err := h.k8sClient.AppsV1().Deployments(ref.Namespace).Delete(context.Background(), ref.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
+		if ipPool.Status.AgentPodRef != nil {
+			ref := ipPool.Status.AgentPodRef
+			logrus.Infof("(ippool.cleanup) remove the legacy backing agent pod %s/%s for ippool %s/%s", ref.Namespace, ref.Name, ipPool.Namespace, ipPool.Name)
+			if err := h.k8sClient.CoreV1().Pods(ref.Namespace).Delete(context.Background(), ref.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
 	}
 
-	logrus.Infof("(ippool.cleanup) remove the backing agent %s/%s for ippool %s/%s", ipPool.Status.AgentPodRef.Namespace, ipPool.Status.AgentPodRef.Name, ipPool.Namespace, ipPool.Name)
-	if err := h.podClient.Delete(ipPool.Status.AgentPodRef.Namespace, ipPool.Status.AgentPodRef.Name, &metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-		return err
+	if h.ipAllocator != nil {
+		h.ipAllocator.DeleteIPSubnet(ipPool.Spec.NetworkName)
 	}
-
-	h.ipAllocator.DeleteIPSubnet(ipPool.Spec.NetworkName)
-	h.cacheAllocator.DeleteMACSet(ipPool.Spec.NetworkName)
-	h.metricsAllocator.DeleteIPPool(
-		ipPool.Spec.NetworkName,
-		ipPool.Spec.IPv4Config.CIDR,
-		ipPool.Spec.NetworkName,
-	)
+	if h.cacheAllocator != nil {
+		h.cacheAllocator.DeleteMACSet(ipPool.Spec.NetworkName)
+	}
+	if h.metricsAllocator != nil {
+		h.metricsAllocator.DeleteIPPool(
+			ipPool.Spec.NetworkName,
+			ipPool.Spec.IPv4Config.CIDR,
+			ipPool.Spec.NetworkName,
+		)
+	}
 
 	return nil
 }

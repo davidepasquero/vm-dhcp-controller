@@ -8,6 +8,7 @@ import (
 
 	cniv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	"github.com/rancher/wrangler/v3/pkg/kv"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -15,7 +16,6 @@ import (
 
 	"github.com/harvester/vm-dhcp-controller/pkg/apis/network.harvesterhci.io"
 	networkv1 "github.com/harvester/vm-dhcp-controller/pkg/apis/network.harvesterhci.io/v1alpha1"
-	"github.com/harvester/vm-dhcp-controller/pkg/config"
 	"github.com/harvester/vm-dhcp-controller/pkg/util"
 )
 
@@ -25,7 +25,7 @@ func prepareAgentPod(
 	agentNamespace string,
 	clusterNetwork string,
 	agentServiceAccountName string,
-	agentImage *config.Image,
+	agentImage string,
 ) (*corev1.Pod, error) {
 	name := util.SafeAgentConcatName(ipPool.Namespace, ipPool.Name)
 
@@ -93,7 +93,7 @@ func prepareAgentPod(
 			InitContainers: []corev1.Container{
 				{
 					Name:            "ip-setter",
-					Image:           agentImage.String(),
+					Image:           agentImage,
 					ImagePullPolicy: corev1.PullIfNotPresent,
 					Command: []string{
 						"/bin/sh",
@@ -114,7 +114,7 @@ func prepareAgentPod(
 			Containers: []corev1.Container{
 				{
 					Name:  "agent",
-					Image: agentImage.String(),
+					Image: agentImage,
 					Args:  args,
 					Env: []corev1.EnvVar{
 						{
@@ -148,6 +148,52 @@ func prepareAgentPod(
 						},
 					},
 				},
+			},
+		},
+	}, nil
+}
+
+func prepareAgentDeployment(
+	ipPool *networkv1.IPPool,
+	noDHCP bool,
+	agentNamespace string,
+	clusterNetwork string,
+	agentServiceAccountName string,
+	agentImage string,
+) (*appsv1.Deployment, error) {
+	pod, err := prepareAgentPod(ipPool, noDHCP, agentNamespace, clusterNetwork, agentServiceAccountName, agentImage)
+	if err != nil {
+		return nil, err
+	}
+
+	replicas := int32(1)
+	maxUnavailable := intstr.FromInt(1)
+	maxSurge := intstr.FromInt(0)
+
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pod.Name,
+			Namespace: pod.Namespace,
+			Labels:    pod.Labels,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: pod.Labels,
+			},
+			Strategy: appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{
+					MaxUnavailable: &maxUnavailable,
+					MaxSurge:       &maxSurge,
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      pod.Labels,
+					Annotations: pod.Annotations,
+				},
+				Spec: pod.Spec,
 			},
 		},
 	}, nil
@@ -254,6 +300,17 @@ func (b *IPPoolBuilder) AgentPodRef(namespace, name, image, uid string) *IPPoolB
 	return b
 }
 
+func (b *IPPoolBuilder) AgentDeploymentRef(namespace, name, image, uid string) *IPPoolBuilder {
+	if b.ipPool.Status.AgentDeploymentRef == nil {
+		b.ipPool.Status.AgentDeploymentRef = new(networkv1.DeploymentReference)
+	}
+	b.ipPool.Status.AgentDeploymentRef.Namespace = namespace
+	b.ipPool.Status.AgentDeploymentRef.Name = name
+	b.ipPool.Status.AgentDeploymentRef.Image = image
+	b.ipPool.Status.AgentDeploymentRef.UID = types.UID(uid)
+	return b
+}
+
 func (b *IPPoolBuilder) Allocated(ipAddress, macAddress string) *IPPoolBuilder {
 	if b.ipPool.Status.IPv4 == nil {
 		b.ipPool.Status.IPv4 = new(networkv1.IPv4Status)
@@ -326,6 +383,17 @@ func (b *ipPoolStatusBuilder) AgentPodRef(namespace, name, image, uid string) *i
 	return b
 }
 
+func (b *ipPoolStatusBuilder) AgentDeploymentRef(namespace, name, image, uid string) *ipPoolStatusBuilder {
+	if b.ipPoolStatus.AgentDeploymentRef == nil {
+		b.ipPoolStatus.AgentDeploymentRef = new(networkv1.DeploymentReference)
+	}
+	b.ipPoolStatus.AgentDeploymentRef.Namespace = namespace
+	b.ipPoolStatus.AgentDeploymentRef.Name = name
+	b.ipPoolStatus.AgentDeploymentRef.Image = image
+	b.ipPoolStatus.AgentDeploymentRef.UID = types.UID(uid)
+	return b
+}
+
 func (b *ipPoolStatusBuilder) RegisteredCondition(status corev1.ConditionStatus, reason, message string) *ipPoolStatusBuilder {
 	networkv1.Registered.SetStatus(&b.ipPoolStatus, string(status))
 	networkv1.Registered.Reason(&b.ipPoolStatus, reason)
@@ -371,6 +439,14 @@ func newPodBuilder(namespace, name string) *podBuilder {
 			},
 		},
 	}
+}
+
+func (b *podBuilder) Label(key, value string) *podBuilder {
+	if b.pod.Labels == nil {
+		b.pod.Labels = map[string]string{}
+	}
+	b.pod.Labels[key] = value
+	return b
 }
 
 func (b *podBuilder) Container(name, repository, tag string) *podBuilder {

@@ -123,6 +123,11 @@ func (in *IPPoolStatus) DeepCopyInto(out *IPPoolStatus) {
 		*out = new(PodReference)
 		**out = **in
 	}
+	if in.AgentDeploymentRef != nil {
+		in, out := &in.AgentDeploymentRef, &out.AgentDeploymentRef
+		*out = new(DeploymentReference)
+		**out = **in
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]genericcondition.GenericCondition, len(*in))
